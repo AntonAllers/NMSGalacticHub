@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Secret tool</title>
+<style>
+body {
+  background: black;
+  color: lightgray;
+  font-family: Arial, sans-serif;
+  max-width: 600px;
+  margin: 30px auto;
+  padding: 0 10px;
+}
+h1 {
+  font-family: "Times New Roman", serif;
+  font-weight: normal;
+  border-bottom: 1px solid gray;
+}
+label {
+  display: block;
+  margin-top: 15px;
+}
+textarea, input {
+  width: 100%;
+  box-sizing: border-box;
+  background: black;
+  color: white;
+  border: 1px solid gray;
+  padding: 6px;
+  font-size: 15px;
+}
+textarea {
+  height: 150px;
+  font-family: monospace;
+}
+button {
+  margin-top: 15px;
+  padding: 6px 14px;
+  background: black;
+  color: lightskyblue;
+  border: 1px solid lightskyblue;
+  font-size: 15px;
+  cursor: pointer;
+}
+.error { color: salmon; }
+.ok { color: lightgreen; }
+</style>
+</head>
+<body>
+
+<h1>Galactic Hub Secret tool</h1>
+<p><b>Not secure. Do not store sensitive data.</b></p>
+
+<label for="content">Content (wikitext, shown after unlock)</label>
+<textarea id="content"></textarea>
+
+<label for="key">Key</label>
+<input id="key" autocomplete="off">
+
+<label for="id">Secret id</label>
+<input id="id" type="number" min="0">
+
+<button id="encrypt">Encrypt</button>
+<p id="message"></p>
+
+<div id="result" style="display: none">
+  <label for="output">Paste this into the new page Secret/Name</label>
+  <textarea id="output" readonly></textarea>
+  <button id="copy">Copy</button>
+</div>
+
+<script>
+var ITERATIONS = 5000;
+
+function toHex(bytes) {
+  var hex = "";
+  for (var i = 0; i < bytes.length; i++) {
+    hex += ("0" + bytes[i].toString(16)).slice(-2);
+  }
+  return hex;
+}
+
+function randomBytes(count) {
+  return crypto.getRandomValues(new Uint8Array(count));
+}
+
+function join(a, b) {
+  var result = new Uint8Array(a.length + b.length);
+  result.set(a);
+  result.set(b, a.length);
+  return result;
+}
+
+// 4 bytes, big endian (Uint8Array keeps only the low 8 bits of each value)
+function counterBytes(n) {
+  return new Uint8Array([n >>> 24, n >>> 16, n >>> 8, n]);
+}
+
+function makeHmacKey(bytes) {
+  return crypto.subtle.importKey("raw", bytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+
+async function hmac(key, data) {
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
+}
+
+async function encrypt(text, password) {
+  var encoder = new TextEncoder();
+  var salt = randomBytes(16);
+  var nonce = randomBytes(16);
+
+  // password -> master key -> separate keys for encryption and for the tag
+  var passwordKey = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  var params = { name: "PBKDF2", hash: "SHA-256", salt: salt, iterations: ITERATIONS };
+  var master = new Uint8Array(await crypto.subtle.deriveBits(params, passwordKey, 256));
+  var masterKey = await makeHmacKey(master);
+  var encryptKey = await makeHmacKey(await hmac(masterKey, encoder.encode("enc")));
+  var tagKey = await makeHmacKey(await hmac(masterKey, encoder.encode("mac")));
+
+  // XOR the text with a keystream: one HMAC block (32 bytes) per counter value
+  var data = encoder.encode(text);
+  var encrypted = new Uint8Array(data.length);
+  for (var start = 0, counter = 0; start < data.length; start += 32, counter++) {
+    var block = await hmac(encryptKey, join(nonce, counterBytes(counter)));
+    for (var i = 0; i < 32 && start + i < data.length; i++) {
+      encrypted[start + i] = data[start + i] ^ block[i];
+    }
+  }
+
+  var tag = await hmac(tagKey, join(nonce, encrypted));
+  return {
+    salt: toHex(salt),
+    nonce: toHex(nonce),
+    tag: toHex(tag),
+    data: toHex(encrypted)
+  };
+}
+
+function showMessage(text, cssClass) {
+  var message = document.getElementById("message");
+  message.textContent = text;
+  message.className = cssClass;
+}
+
+async function onEncrypt() {
+  var content = document.getElementById("content").value;
+  var key = document.getElementById("key").value;
+  var id = parseInt(document.getElementById("id").value, 10);
+
+  if (content == "") return showMessage("Enter some content.", "error");
+  if (content.length > 40000) return showMessage("Content is too long.", "error");
+  if (key == "") return showMessage("Enter a key.", "error");
+  if (key != key.trim()) return showMessage("The key must not start or end with a space.", "error");
+  if (/[|{}\[\]<>]/.test(key)) return showMessage("The key must not contain | { } [ ] < >", "error");
+  if (!(id >= 0)) return showMessage("Enter a secret id.", "error");
+
+  showMessage("Encrypting...", "");
+  var secret = await encrypt(content, key);
+
+  document.getElementById("output").value =
+    "{{Secret\n" +
+    "|id=" + id + "\n" +
+    "|iter=" + ITERATIONS + "\n" +
+    "|salt=" + secret.salt + "\n" +
+    "|nonce=" + secret.nonce + "\n" +
+    "|tag=" + secret.tag + "\n" +
+    "|data=" + secret.data + "\n" +
+    "}}";
+  document.getElementById("result").style.display = "block";
+  showMessage("Done. The key cannot be recovered, so keep it.", "ok");
+}
+
+function onCopy() {
+  document.getElementById("output").select();
+  document.execCommand("copy");
+}
+
+document.getElementById("encrypt").onclick = onEncrypt;
+document.getElementById("copy").onclick = onCopy;
+</script>
+
+</body>
+</html>
